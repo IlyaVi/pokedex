@@ -1,4 +1,4 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { useIsMutating } from "@tanstack/react-query";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { PokemonCard, PokemonCardSkeleton } from "@/components/PokemonCard";
@@ -17,30 +17,54 @@ interface PokemonListProps {
 }
 
 export function PokemonList({ pageSize, order, type, search }: PokemonListProps) {
-  const { data, isLoading, isError, isFetching, fetchNextPage, hasNextPage, isFetchingNextPage } =
-    usePokemonInfinite({ page_size: pageSize, order, type, search });
-
   const { savedIndex, setSavedIndex } = useScrollPosition();
   const isCapturing = useIsMutating({ mutationKey: ["capture"] }) > 0;
-
   const containerRef = useRef<HTMLDivElement>(null);
-  // Item index we need to restore to — cleared once restore succeeds.
   const pendingRestore = useRef<number>(savedIndex);
-  const isFirstMount = useRef(true);
+  const [restoring, setRestoring] = useState(savedIndex > 0);
 
-  // Skip reset on first mount; reset when filters change.
-  useEffect(() => {
-    if (isFirstMount.current) {
-      isFirstMount.current = false;
-      return;
-    }
+  // --- Synchronous filter-change detection (runs during render) ---
+  // Must be synchronous so startPage is correct on the same render
+  // the queryKey changes — otherwise initialPageParam would be stale.
+  const prevFilters = useRef({ order, type, search, pageSize });
+  if (
+    prevFilters.current.order !== order ||
+    prevFilters.current.type !== type ||
+    prevFilters.current.search !== search ||
+    prevFilters.current.pageSize !== pageSize
+  ) {
     pendingRestore.current = 0;
+  }
+
+  const startPage =
+    pendingRestore.current > 0
+      ? Math.floor(pendingRestore.current / pageSize) + 1
+      : 1;
+
+  const {
+    data, isLoading, isError, isFetching,
+    fetchNextPage, hasNextPage, isFetchingNextPage,
+    fetchPreviousPage, hasPreviousPage, isFetchingPreviousPage,
+  } = usePokemonInfinite({ page_size: pageSize, order, type, search, startPage });
+
+  // Side-effects for filter reset (localStorage, DOM, state).
+  useEffect(() => {
+    const prev = prevFilters.current;
+    prevFilters.current = { order, type, search, pageSize };
+    if (prev.order === order && prev.type === type && prev.search === search && prev.pageSize === pageSize) return;
     setSavedIndex(0);
+    setRestoring(false);
     if (containerRef.current) containerRef.current.scrollTop = 0;
-  // eslint-disable-next-line react-hooks/exhaustive-deps
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [order, type, search, pageSize]);
 
+  // --- Derived data ---
   const allPokemon = data?.pages.flatMap((p) => p.results) ?? [];
+  const firstPageParam = (data?.pageParams?.[0] as number | undefined) ?? startPage;
+  const globalOffset = (firstPageParam - 1) * pageSize;
+  const globalOffsetRef = useRef(globalOffset);
+  globalOffsetRef.current = globalOffset;
+
   const rowCount = allPokemon.length + (hasNextPage || isFetchingNextPage ? 1 : 0);
 
   const virtualizer = useVirtualizer({
@@ -50,8 +74,7 @@ export function PokemonList({ pageSize, order, type, search }: PokemonListProps)
     overscan: OVERSCAN,
   });
 
-  // Save the first visible item index on scroll (rAF-throttled).
-  // Derived from scrollTop / ROW_HEIGHT to avoid reading virtualizer state.
+  // --- Save global index on scroll (rAF-throttled) ---
   useEffect(() => {
     const el = containerRef.current;
     if (!el) return;
@@ -59,36 +82,66 @@ export function PokemonList({ pageSize, order, type, search }: PokemonListProps)
     const onScroll = () => {
       cancelAnimationFrame(rafId);
       rafId = requestAnimationFrame(() => {
-        setSavedIndex(Math.floor(el.scrollTop / ROW_HEIGHT));
+        setSavedIndex(globalOffsetRef.current + Math.floor(el.scrollTop / ROW_HEIGHT));
       });
     };
     el.addEventListener("scroll", onScroll, { passive: true });
     return () => { el.removeEventListener("scroll", onScroll); cancelAnimationFrame(rafId); };
   }, [setSavedIndex]);
 
-  // Restore visible index after each fetch settles:
-  //   - if we have enough items → scrollToIndex
-  //   - if not → fetch the next page and retry when it arrives
+  // --- Restore scroll position ---
+  // May need one extra page fetch if the target item is near the end of
+  // the loaded data and the scroll container isn't tall enough to reach it.
   useEffect(() => {
     if (isLoading || isFetchingNextPage) return;
-    if (pendingRestore.current === 0) return;
-
-    if (allPokemon.length > pendingRestore.current) {
-      const target = pendingRestore.current;
-      pendingRestore.current = 0;
-      // rAF ensures the virtualizer has measured the new rows before scrolling
-      requestAnimationFrame(() => {
-        virtualizer.scrollToIndex(target, { align: "start" });
-      });
-    } else if (hasNextPage) {
-      void fetchNextPage();
+    if (pendingRestore.current === 0) {
+      if (restoring) setRestoring(false);
+      return;
     }
-  // eslint-disable-next-line react-hooks/exhaustive-deps
+
+    const localIndex = pendingRestore.current - globalOffset;
+    if (localIndex >= 0 && localIndex < allPokemon.length) {
+      const el = containerRef.current;
+      const maxScroll = rowCount * ROW_HEIGHT - (el?.clientHeight ?? 0);
+      if (localIndex * ROW_HEIGHT > maxScroll && hasNextPage) {
+        void fetchNextPage();
+        return;
+      }
+      pendingRestore.current = 0;
+      requestAnimationFrame(() => {
+        virtualizer.scrollToIndex(localIndex, { align: "start" });
+        requestAnimationFrame(() => setRestoring(false));
+      });
+    } else {
+      pendingRestore.current = 0;
+      setRestoring(false);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isLoading, isFetchingNextPage]);
 
-  // Trigger next-page load when virtualizer window reaches the last loaded item.
+  // --- Adjust scrollTop when previous pages are prepended ---
+  const prevFirstPage = useRef<number | undefined>(undefined);
+  useLayoutEffect(() => {
+    if (prevFirstPage.current !== undefined && firstPageParam < prevFirstPage.current) {
+      const pagesAdded = prevFirstPage.current - firstPageParam;
+      const el = containerRef.current;
+      if (el) el.scrollTop += pagesAdded * pageSize * ROW_HEIGHT;
+    }
+    prevFirstPage.current = firstPageParam;
+  }, [firstPageParam, pageSize]);
+
+  // --- Bidirectional infinite scroll triggers ---
   const virtualItems = virtualizer.getVirtualItems();
+  const firstVirtualItem = virtualItems[0];
   const lastVirtualItem = virtualItems[virtualItems.length - 1];
+
+  useEffect(() => {
+    if (!firstVirtualItem) return;
+    if (firstVirtualItem.index === 0 && hasPreviousPage && !isFetchingPreviousPage) {
+      void fetchPreviousPage();
+    }
+  }, [firstVirtualItem?.index, hasPreviousPage, isFetchingPreviousPage, fetchPreviousPage]);
+
   useEffect(() => {
     if (!lastVirtualItem) return;
     if (lastVirtualItem.index >= allPokemon.length - 1 && hasNextPage && !isFetchingNextPage) {
@@ -96,21 +149,22 @@ export function PokemonList({ pageSize, order, type, search }: PokemonListProps)
     }
   }, [lastVirtualItem, allPokemon.length, hasNextPage, isFetchingNextPage, fetchNextPage]);
 
-  const isRefetching = isFetching && !isFetchingNextPage;
-  const showOverlay = isRefetching || isCapturing;
+  // --- Render ---
+  const isRefetching = isFetching && !isFetchingNextPage && !isFetchingPreviousPage;
+  const showOverlay = isRefetching || isCapturing || restoring;
 
   if (isError) {
     return <p className="text-center text-destructive py-12">Failed to load Pokémon. Please try again.</p>;
   }
 
-  if (!isLoading && allPokemon.length === 0) {
+  if (!isLoading && !restoring && allPokemon.length === 0) {
     return <p className="text-center text-muted-foreground py-12">No Pokémon found. Try adjusting the filters.</p>;
   }
 
   return (
     <div className="rounded-lg border overflow-hidden flex flex-col relative" style={{ height: "calc(100vh - 140px)" }}>
       {showOverlay && (
-        <div className="absolute inset-0 z-10 flex items-center justify-center bg-background/40 backdrop-blur-sm">
+        <div className={`absolute inset-0 z-10 flex items-center justify-center ${restoring ? "bg-background" : "bg-background/40 backdrop-blur-sm"}`}>
           <div className="w-10 h-10 rounded-full border-4 border-muted border-t-primary animate-spin" />
         </div>
       )}
