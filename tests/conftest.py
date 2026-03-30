@@ -1,6 +1,7 @@
 import pytest
 from fastapi.testclient import TestClient
 
+import data as data_module
 import state
 from main import app
 
@@ -22,6 +23,7 @@ FAKE_POKEMON = [
 
 @pytest.fixture(autouse=True)
 def reset_captured():
+    data_module.get_all.cache_clear()
     state.captured_ids.clear()
     yield
     state.captured_ids.clear()

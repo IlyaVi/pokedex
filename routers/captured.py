@@ -1,6 +1,6 @@
 from fastapi import APIRouter, HTTPException
 
-import db
+from data import get_all
 import state
 from models import CapturedResponse, CapturedListResponse
 
@@ -16,8 +16,8 @@ def get_captured():
 
 @router.post("/pokemon/{number}/capture", response_model=CapturedResponse)
 def capture_pokemon(number: int):
-    data: list[dict] = db.get()
-    if not any(p["number"] == number for p in data):
+    all_pokemon: list[dict] = get_all()
+    if not any(p["number"] == number for p in all_pokemon):
         raise HTTPException(status_code=404, detail="Pokemon not found")
     with state._lock:
         state.captured_ids.add(number)

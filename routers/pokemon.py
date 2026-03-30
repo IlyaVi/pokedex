@@ -3,7 +3,7 @@ from fastapi.responses import RedirectResponse
 from typing import Optional
 import re
 
-import db
+from data import get_all
 import state
 from models import Pokemon, PokemonListResponse
 
@@ -56,28 +56,30 @@ def list_pokemon(
             detail=f"page_size must be one of {sorted(ALLOWED_PAGE_SIZES)}",
         )
 
-    data: list[dict] = db.get()
+    all_pokemon: list[dict] = get_all()
+
+    filtered = all_pokemon
 
     if type:
         type_lower = type.lower()
-        data = [
-            p for p in data
+        filtered = [
+            p for p in filtered
             if p["type_one"].lower() == type_lower
             or (p.get("type_two") and p["type_two"].lower() == type_lower)
         ]
 
     if search:
         search_lower = search.lower()
-        data = [
-            p for p in data
+        filtered = [
+            p for p in filtered
             if any(search_lower in str(v).lower() for v in p.values())
         ]
 
-    data.sort(key=lambda p: p["number"], reverse=(order == "desc"))
+    filtered = sorted(filtered, key=lambda p: p["number"], reverse=(order == "desc"))
 
-    total = len(data)
+    total = len(filtered)
     start = (page - 1) * page_size
-    page_data = data[start: start + page_size]
+    page_data = filtered[start: start + page_size]
 
     captured_snapshot = state.captured_ids.copy()
     results = [_build_pokemon(p, p["number"] in captured_snapshot) for p in page_data]
@@ -87,9 +89,9 @@ def list_pokemon(
 
 @router.get("/pokemon/types")
 def list_types() -> list[str]:
-    data: list[dict] = db.get()
+    all_pokemon: list[dict] = get_all()
     types: set[str] = set()
-    for p in data:
+    for p in all_pokemon:
         types.add(p["type_one"].lower())
         if p.get("type_two"):
             types.add(p["type_two"].lower())
@@ -98,8 +100,8 @@ def list_types() -> list[str]:
 
 @router.get("/pokemon/{number}/image")
 def get_image(number: int):
-    data: list[dict] = db.get()
-    pokemon = next((p for p in data if p["number"] == number), None)
+    all_pokemon: list[dict] = get_all()
+    pokemon = next((p for p in all_pokemon if p["number"] == number), None)
     if not pokemon:
         raise HTTPException(status_code=404, detail="Pokemon not found")
     slug = _name_to_slug(pokemon["name"])
